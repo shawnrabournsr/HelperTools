@@ -1,25 +1,42 @@
+
+#########################################################################################################################################################
+#
+# This script was written by Shawn Rabourn of Quest Software June 2026
+#
+# This script comes with no warranties, guarantees or any other feel-good devices, use at own risk.
+# 
+# The purpose of this script is to create SRV records on a workgroup DNS server for tactical recoveries
+# 
+# 
+#
+#########################################################################################################################################################
+
+
+
 param(
+
+    
     [Parameter(Mandatory)]
-    [string]$Domain,
+    [string]$Domain,      # Target domain / FLZ
 
     [Parameter(Mandatory)]
-    [string]$DC,
+    [string]$DC,          # DC 
 
     [Parameter(Mandatory)]
-    [string]$IP,
+    [string]$IP,          # IP of the DC
 
     [Parameter(Mandatory)]
-    [string]$Site,
+    [string]$Site,         # the site name
 
     [Parameter(Mandatory)]
     [string]$GUID,          # DC GUID
 
-    [string]$ParentDomain,  # Optional
+    [string]$ParentDomain,  # Optional - if you are a child with a parent DNS zone
 
     [switch]$GC,            # Optional GC SRVs
     [switch]$PDC,           # Optional PDC SRV
 
-    [string]$ForestRoot,    # Optional: forest root domain
+    [string]$ForestRoot,    # Optional: forest root domain 
     [string]$DomainGUID     # Optional: domain GUID (required if ForestRoot is used)
 )
 
