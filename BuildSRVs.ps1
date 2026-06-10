@@ -71,7 +71,6 @@
 
 ===============================================================================
 #>
-
 param(
     [Parameter(Mandatory)]
     [string]$Domain,        # Target domain / FLZ
@@ -126,6 +125,63 @@ Write-Host (" GC Enabled:    {0}" -f $GC.IsPresent)
 Write-Host (" PDC Enabled:   {0}" -f $PDC.IsPresent)
 Write-Host "========================================="
 Write-Host ""
+# ================================
+# PARAMETER VALIDATION
+# ================================
+function Test-Parameters {
+
+    Write-Host "Validating parameters..." -ForegroundColor Cyan
+
+    # --- Domain ---
+    if ($Domain -notmatch '^[a-zA-Z0-9.-]+$') {
+        throw "Invalid Domain: '$Domain'"
+    }
+
+    # --- DC hostname ---
+    if ($DC -notmatch '^[a-zA-Z0-9-]+$') {
+        throw "Invalid DC hostname: '$DC'"
+    }
+
+    # --- IPv4 ---
+    if ($IP -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+        throw "Invalid IPv4 address: '$IP'"
+    }
+    $oct = $IP.Split('.')
+    if ($oct | Where-Object { [int]$_ -gt 255 }) {
+        throw "Invalid IPv4 address (octet out of range): '$IP'"
+    }
+
+    # --- Site ---
+    if ($Site -notmatch '^[a-zA-Z0-9._-]+$') {
+        throw "Invalid Site name: '$Site'"
+    }
+
+    # --- DC GUID ---
+    if ($GUID -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw "Invalid DC GUID: '$GUID'"
+    }
+
+    # --- Parent Domain ---
+    if ($ParentDomain -and ($ParentDomain -notmatch '^[a-zA-Z0-9.-]+$')) {
+        throw "Invalid ParentDomain: '$ParentDomain'"
+    }
+
+    # --- Forest Root ---
+    if ($ForestRoot -and ($ForestRoot -notmatch '^[a-zA-Z0-9.-]+$')) {
+        throw "Invalid ForestRoot: '$ForestRoot'"
+    }
+
+    # --- Domain GUID (only if ForestRoot is used) ---
+    if ($ForestRoot -and -not $DomainGUID) {
+        throw "DomainGUID is required when ForestRoot is specified."
+    }
+
+    if ($DomainGUID -and ($DomainGUID -notmatch '^[0-9a-fA-F-]{36}$')) {
+        throw "Invalid DomainGUID: '$DomainGUID'"
+    }
+
+    Write-Host "Parameter validation passed." -ForegroundColor Green
+}
 
 # ================================
 # FUNCTIONS
@@ -255,6 +311,8 @@ $Tcp      = "_tcp"
 $Udp      = "_udp"
 $SitePath = "_sites.$Site"
 
+# Validate everything before touching DNS
+Test-Parameters
 # ================================
 # ENSURE ZONES
 # ================================
