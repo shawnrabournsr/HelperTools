@@ -1,23 +1,27 @@
 <#
 .SYNOPSIS
-    Get-RMADGrab v2.1.2
-    RMAD Baseline Extractor (Console + JSON + Markdown)
+    RMADGrab v2.2
+    RMAD Baseline Extractor (Edition-aware, Version-aware)
 
 .DESCRIPTION
     Extracts RMAD configuration, collections, backup posture, forest recovery,
     hybrid recovery, sessions, environment identity, and directory service
     (Recycle Bin + Tombstone Lifetime).
 
+    Adds:
+        - RMAD version detection
+        - RMAD edition detection (Standard vs DRE/Forest Edition)
+        - Warning if RMAD version < 10.4
+        - Skips FE-only sections on Standard RMAD
+
     Outputs in current directory:
         - RMADGrab_yyyy-MM-dd_HHmmss.json      (pretty)
         - RMADGrab_yyyy-MM-dd_HHmmss.min.json  (minified)
         - RMADGrab_yyyy-MM-dd_HHmmss.md        (Markdown)
-
-    No judgement. Pure data for evaluation later.
 #>
 
 Write-Host "========================================="
-Write-Host " RMADGrab v2.1.2 — RMAD Baseline Extractor"
+Write-Host " RMADGrab v2.2 — RMAD Baseline Extractor"
 Write-Host " Generated: $(Get-Date)"
 Write-Host "=========================================`n"
 
@@ -30,6 +34,89 @@ $jsonFile  = "RMADGrab_$timestamp.json"
 $jsonMin   = "RMADGrab_$timestamp.min.json"
 
 $RMADGrab = [ordered]@{}
+
+# ---------------------------------------------------------
+# META (Edition + Version Detection)
+# ---------------------------------------------------------
+Write-Host "=== RMADGrab v2.2 — Edition & Version Detection ==="
+
+$RMADGrab.Meta = [ordered]@{
+    RMADVersion     = $null
+    RMADEdition     = "Unknown"
+    IsDRE           = $false
+    VersionOK       = $false
+    Modules         = @()
+    Warnings        = @()
+    SkippedSections = @()
+}
+
+function Add-Warn { param($msg) ; $RMADGrab.Meta.Warnings += $msg ; Write-Warning $msg }
+function Skip-Section { param($name) ; $RMADGrab.Meta.SkippedSections += $name ; Write-Host "Skipping section: $name" }
+
+# Detect RMAD version
+Write-Host "Detecting RMAD Version..."
+
+$rmadVer = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
+           Where-Object { $_.DisplayName -like "Recovery Manager*" } |
+           Select-Object DisplayName, DisplayVersion, Publisher
+
+if ($rmadVer) {
+    $RMADGrab.Meta.RMADVersion = $rmadVer.DisplayVersion
+    Write-Host "RMAD Version Detected: $($rmadVer.DisplayVersion)"
+} else {
+    Add-Warn "RMAD not detected on this server. Extraction will be limited."
+}
+
+# Version check (<10.4 warning)
+if ($RMADGrab.Meta.RMADVersion) {
+    try {
+        $ver = [version]$RMADGrab.Meta.RMADVersion
+        if ($ver.Major -ge 10 -and $ver.Minor -ge 4) {
+            $RMADGrab.Meta.VersionOK = $true
+            Write-Host "RMAD version is 10.4 or higher — OK."
+        } else {
+            Add-Warn "RMAD version is below 10.4 — some settings may not render correctly."
+            $RMADGrab.Meta.VersionOK = $false
+        }
+    }
+    catch {
+        Add-Warn "Unable to parse RMAD version."
+    }
+}
+
+Write-Host ""
+
+# Detect RMAD edition (Standard vs DRE)
+Write-Host "Detecting RMAD Edition..."
+
+$dllFE = @(
+    "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll",
+    "QuestSoftware.RecoveryManager.AD.PowerShell64.dll"
+)
+
+$modulesFound = @()
+
+foreach ($dll in $dllFE) {
+    $found = Get-Module -ListAvailable |
+             Where-Object { $_.Name -like "*RecoveryManager*" -and $_.Path -like "*$dll*" }
+    if ($found) { $modulesFound += $found }
+}
+
+$RMADGrab.Meta.Modules = $modulesFound
+
+if ($modulesFound.Count -gt 0) {
+    $RMADGrab.Meta.IsDRE = $true
+    $RMADGrab.Meta.RMADEdition = "Forest Edition (DRE)"
+    Write-Host "RMAD Edition: Forest Edition (DRE)"
+} else {
+    $RMADGrab.Meta.IsDRE = $false
+    $RMADGrab.Meta.RMADEdition = "Standard Edition"
+    Write-Host "RMAD Edition: Standard Edition"
+}
+
+Write-Host ""
+Write-Host "=== Edition & Version Detection Complete ==="
+Write-Host "`n"
 
 # ---------------------------------------------------------
 # MODULE DISCOVERY
@@ -48,11 +135,11 @@ if (-not $installPath) {
     Write-Host "RMAD InstallPath: $installPath"
 
     $dll64 = Join-Path $installPath "QuestSoftware.RecoveryManager.AD.PowerShell64.dll"
-    $dllFE = Join-Path $installPath "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll"
+    $dllFEPath = Join-Path $installPath "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll"
 
     $loadedModules = @()
 
-    foreach ($dll in @($dll64, $dllFE)) {
+    foreach ($dll in @($dll64, $dllFEPath)) {
         if (Test-Path $dll) {
             try {
                 Import-Module $dll -ErrorAction SilentlyContinue
@@ -80,19 +167,17 @@ $hostname = $env:COMPUTERNAME
 $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
        Where-Object { $_.IPAddress -notlike "169.*" }).IPAddress
 
-$rmadVer = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
-           Where-Object { $_.DisplayName -like "Recovery Manager*" } |
-           Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+$rmadVerDetail = $rmadVer
 
 $RMADGrab.ServerIdentity = @{
     Hostname    = $hostname
     IPAddresses = $ip
-    RMADVersion = $rmadVer
+    RMADVersion = $rmadVerDetail
 }
 
 Write-Host "Hostname: $hostname"
 Write-Host "IP: $ip"
-Write-Host "RMAD Version: $($rmadVer.DisplayVersion)"
+Write-Host "RMAD Version: $($rmadVerDetail.DisplayVersion)"
 Write-Host "`n"
 
 # ---------------------------------------------------------
@@ -266,7 +351,7 @@ try {
 Write-Host "`n"
 
 # ---------------------------------------------------------
-# HYBRID RECOVERY
+# HYBRID RECOVERY (DRE-only)
 # ---------------------------------------------------------
 Write-Host "=== HYBRID RECOVERY ==="
 
@@ -275,23 +360,27 @@ $RMADGrab.HybridRecovery = [ordered]@{
     Domains = @()
 }
 
-try {
-    $hyGlobal = Get-RMADHybridRecoveryOptions -ErrorAction SilentlyContinue
-    $hyDomains = Get-RMADHybridRecoveryDomainOptions -ErrorAction SilentlyContinue
+if ($RMADGrab.Meta.IsDRE) {
+    try {
+        $hyGlobal  = Get-RMADHybridRecoveryOptions -ErrorAction SilentlyContinue
+        $hyDomains = Get-RMADHybridRecoveryDomainOptions -ErrorAction SilentlyContinue
 
-    $RMADGrab.HybridRecovery.Global  = $hyGlobal
-    $RMADGrab.HybridRecovery.Domains = $hyDomains
+        $RMADGrab.HybridRecovery.Global  = $hyGlobal
+        $RMADGrab.HybridRecovery.Domains = $hyDomains
 
-    if ($hyGlobal)  { $hyGlobal  | Format-List * }
-    if ($hyDomains) { $hyDomains | Format-Table DomainName, Enabled, TenantId }
-} catch {
-    Write-Warning "Hybrid Recovery unavailable."
+        if ($hyGlobal)  { $hyGlobal  | Format-List * }
+        if ($hyDomains) { $hyDomains | Format-Table DomainName, Enabled, TenantId }
+    } catch {
+        Write-Warning "Hybrid Recovery unavailable."
+    }
+} else {
+    Skip-Section "HybridRecovery (Standard Edition)"
 }
 
 Write-Host "`n"
 
 # ---------------------------------------------------------
-# FOREST RECOVERY (READ-ONLY)
+# FOREST RECOVERY (DRE-only, READ-ONLY)
 # ---------------------------------------------------------
 Write-Host "=== FOREST RECOVERY ==="
 
@@ -302,31 +391,35 @@ $RMADGrab.ForestRecovery = [ordered]@{
     FaultTolerance = $null
 }
 
-try {
-    $feProj  = Get-RMADFEProject        -ErrorAction SilentlyContinue
-    $feDom   = Get-RMADFEDomain         -ErrorAction SilentlyContinue
-    $feComp  = Get-RMADFEComputer       -ErrorAction SilentlyContinue
-    $feFault = Get-RMADFEFaultTolerance -ErrorAction SilentlyContinue
+if ($RMADGrab.Meta.IsDRE) {
+    try {
+        $feProj  = Get-RMADFEProject        -ErrorAction SilentlyContinue
+        $feDom   = Get-RMADFEDomain         -ErrorAction SilentlyContinue
+        $feComp  = Get-RMADFEComputer       -ErrorAction SilentlyContinue
+        $feFault = Get-RMADFEFaultTolerance -ErrorAction SilentlyContinue
 
-    $RMADGrab.ForestRecovery.Project        = $feProj
-    $RMADGrab.ForestRecovery.Domains        = $feDom
-    $RMADGrab.ForestRecovery.Computers      = $feComp
-    $RMADGrab.ForestRecovery.FaultTolerance = $feFault
+        $RMADGrab.ForestRecovery.Project        = $feProj
+        $RMADGrab.ForestRecovery.Domains        = $feDom
+        $RMADGrab.ForestRecovery.Computers      = $feComp
+        $RMADGrab.ForestRecovery.FaultTolerance = $feFault
 
-    if ($feProj)  { $feProj  | Format-List * }
-    if ($feDom)   { $feDom   | Format-Table Name, ForestName, DomainID }
-    if ($feComp)  { $feComp  | Format-Table ComputerName, DomainName, Role }
-    if ($feFault) { $feFault | Format-List * }
-} catch {
-    Write-Warning "Forest Recovery unavailable."
+        if ($feProj)  { $feProj  | Format-List * }
+        if ($feDom)   { $feDom   | Format-Table Name, ForestName, DomainID }
+        if ($feComp)  { $feComp  | Format-Table ComputerName, DomainName, Role }
+        if ($feFault) { $feFault | Format-List * }
+    } catch {
+        Write-Warning "Forest Recovery unavailable."
+    }
+} else {
+    Skip-Section "ForestRecovery (Standard Edition)"
 }
 
 Write-Host "`n"
 
 # ---------------------------------------------------------
-# DIRECTORY SERVICE 
+# DIRECTORY SERVICE (Resilient Version)
 # ---------------------------------------------------------
-Write-Host "=== DIRECTORY SERVICE ==="
+Write-Host "=== DIRECTORY SERVICE (Resilient) ==="
 
 $RMADGrab.DirectoryService = [ordered]@{
     RecycleBinEnabled      = $null
@@ -367,9 +460,7 @@ try {
         }
     }
 
-    # -----------------------------
     # Recycle Bin Detection
-    # -----------------------------
     Add-Diag "Step 2: Checking Recycle Bin Feature object..."
 
     $rbPath = "CN=Recycle Bin Feature,CN=Optional Features,CN=Directory Service,CN=Windows NT,CN=Services,$configDN"
@@ -385,9 +476,7 @@ try {
         $RMADGrab.DirectoryService.RecycleBinEnabled = $false
     }
 
-    # -----------------------------
     # Tombstone Lifetime Detection
-    # -----------------------------
     Add-Diag "Step 3: Checking Directory Service object for tombstoneLifetime..."
 
     $dsPath = "CN=Directory Service,CN=Windows NT,CN=Services,$configDN"
@@ -419,7 +508,7 @@ catch {
 Write-Host "`n"
 
 # ---------------------------------------------------------
-# EXPORT JSON 
+# EXPORT JSON (PRETTY + MINIFIED)
 # ---------------------------------------------------------
 Write-Host "=== EXPORT JSON ==="
 
@@ -433,7 +522,7 @@ Write-Host "Pretty JSON written to:  $jsonFile"
 Write-Host "Minified JSON written to: $jsonMin"
 
 # ---------------------------------------------------------
-# EXPORT MARKDOWN 
+# EXPORT MARKDOWN
 # ---------------------------------------------------------
 Write-Host "=== EXPORT MARKDOWN ==="
 
@@ -459,5 +548,5 @@ foreach ($key in $RMADGrab.Keys) {
 Write-Host "Markdown written to: $mdFile"
 Write-Host ""
 Write-Host "==================================="
-Write-Host " RMADGrab v2.1.2 COMPLETE"
+Write-Host " RMADGrab v2.2 COMPLETE"
 Write-Host "==================================="
