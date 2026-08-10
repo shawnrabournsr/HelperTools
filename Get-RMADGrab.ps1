@@ -342,16 +342,53 @@ Write-Host "`n"
 # ---------------------------------------------------------
 # BACKUP INTEGRITY (READ-ONLY)
 # ---------------------------------------------------------
-Write-Host "=== BACKUP INTEGRITY (Last 5 Backups, No DB Write) ==="
+Write-Host "=== BACKUP INTEGRITY (Last 5 Backups) ==="
 
 $RMADGrab.BackupIntegrity = @()
 
+# NOTE: confirmed via `Get-Help Test-RMADBackup -Full` against a live RMAD
+# Forest Edition install that this cmdlet's parameter set is just
+# -Id/-InputObject, -ShareCredential, -UseStorageCredential - there is no
+# "don't write to the database" switch at all, on any version we've checked.
+# Quest's own description says it "calculates the checksum of the backup
+# file and compares it with the checksum stored in the backup" - it does not
+# document writing status back to the registration database as a side
+# effect. So the v2.2 comment "No DB Write" appears to have been an
+# assumption baked into the original script rather than a real, confirmed
+# behavior (or a real switch that existed in some other version).
+#
+# We still probe for a few plausible parameter names in case some other
+# RMAD version *does* expose write-control, so this keeps working if that
+# ever turns out to be true - but we no longer warn alarmingly about a
+# side effect we have no evidence for.
+$noDbWriteParamCandidates = @('NoUpdate', 'DoNotUpdate', 'SkipUpdate', 'ReadOnly', 'CheckOnly', 'NoDbUpdate', 'NoDatabaseUpdate')
+$noDbWriteParam = $null
+
+$testCmd = Get-Command Test-RMADBackup -ErrorAction SilentlyContinue
+if ($testCmd) {
+    foreach ($candidate in $noDbWriteParamCandidates) {
+        if ($testCmd.Parameters.ContainsKey($candidate)) {
+            $noDbWriteParam = $candidate
+            break
+        }
+    }
+}
+
+if ($noDbWriteParam) {
+    Write-Host "Using -$noDbWriteParam to avoid writing status back to the backup registration database."
+} elseif ($testCmd) {
+    Write-Host "This RMAD version's Test-RMADBackup has no write-control switch (only Id/InputObject/ShareCredential/UseStorageCredential per Get-Help) - proceeding as-is. Quest's documentation for this cmdlet doesn't describe a database-write side effect."
+}
+
 try {
     if ($backups) {
+        $testParams = @{ ErrorAction = 'Stop' }
+        if ($noDbWriteParam) { $testParams[$noDbWriteParam] = $true }
+
         $integrity = $backups |
             Sort-Object Date -Descending |
             Select-Object -First 5 |
-            Test-RMADBackup -NoUpdate -ErrorAction Stop
+            Test-RMADBackup @testParams
 
         $RMADGrab.BackupIntegrity = $integrity
         if ($integrity) {
