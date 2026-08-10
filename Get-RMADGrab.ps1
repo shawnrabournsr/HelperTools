@@ -93,6 +93,27 @@ function Get-RedactedCredentialInfo {
     }
 }
 
+# Generic version of the above for object types whose exact property schema
+# isn't confirmed from Quest's documentation (e.g. StorageServer). Rather
+# than guess specific property names and risk missing a secret-bearing one,
+# this scans every property on the object and redacts anything whose *name*
+# looks credential/password-shaped.
+function Get-RedactedObject {
+    param($InputObj)
+
+    if (-not $InputObj) { return $null }
+
+    $result = [ordered]@{}
+    foreach ($prop in $InputObj.PSObject.Properties) {
+        if ($prop.Name -match 'Credential|Password|Secret') {
+            $result[$prop.Name] = Get-RedactedCredentialInfo -CredObj $prop.Value
+        } else {
+            $result[$prop.Name] = $prop.Value
+        }
+    }
+    return [pscustomobject]$result
+}
+
 # ---------------------------------------------------------
 # VERSION DETECTION
 # ---------------------------------------------------------
@@ -401,6 +422,65 @@ try {
     }
 } catch {
     Write-Warning "Backup Integrity unavailable: $($_.Exception.Message)"
+}
+
+Write-Host "`n"
+
+# ---------------------------------------------------------
+# SECURE STORAGE
+# ---------------------------------------------------------
+Write-Host "=== SECURE STORAGE ==="
+
+$RMADGrab.SecureStorage = [ordered]@{
+    Servers      = @()
+    BackupChecks = @()
+}
+
+try {
+    $storageServers = Get-RMADStorageServer -ErrorAction Stop
+
+    if ($storageServers) {
+        foreach ($srv in $storageServers) {
+            $RMADGrab.SecureStorage.Servers += (Get-RedactedObject -InputObj $srv)
+        }
+        $storageServers | Format-List *
+    } else {
+        Write-Host "No secure storage servers registered."
+    }
+} catch {
+    Write-Warning "Secure Storage Servers unavailable: $($_.Exception.Message)"
+}
+
+Write-Host ""
+
+# Spot-check reachability/integrity of a sample of Secure Storage-backed
+# backups, if any showed up in the last-30-days inventory above and the
+# cmdlet is available on this version.
+try {
+    if ($backups) {
+        $secureBackups = $backups | Where-Object { $_.IsSecureStorage }
+
+        if ($secureBackups) {
+            $testSSCmd = Get-Command Test-RMADSecureStorageBackup -ErrorAction SilentlyContinue
+            if ($testSSCmd) {
+                $ssResults = $secureBackups | Select-Object -First 5 | Test-RMADSecureStorageBackup -ErrorAction Stop
+                $RMADGrab.SecureStorage.BackupChecks = $ssResults
+                if ($ssResults) {
+                    $ssResults | Format-Table -AutoSize
+                } else {
+                    Write-Host "No results from Test-RMADSecureStorageBackup."
+                }
+            } else {
+                Write-Host "Test-RMADSecureStorageBackup cmdlet not available on this RMAD version - skipping."
+            }
+        } else {
+            Write-Host "No Secure Storage-backed backups found in the last-30-days sample."
+        }
+    } else {
+        Write-Host "Skipping Secure Storage backup check: no backup inventory available."
+    }
+} catch {
+    Write-Warning "Secure Storage backup check unavailable: $($_.Exception.Message)"
 }
 
 Write-Host "`n"
