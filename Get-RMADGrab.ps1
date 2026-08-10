@@ -1,12 +1,44 @@
 <#
 .SYNOPSIS
-    RMADGrab v3.1
+    RMADGrab v3.2
     RMAD Baseline Extractor (Edition-aware, Version-aware)
 
 .DESCRIPTION
     Extracts RMAD configuration, collections, backup posture, forest recovery,
     hybrid recovery, sessions, environment identity, and directory service
     (Recycle Bin + Tombstone Lifetime).
+
+    Changes from v3.1:
+        - Fixed edition detection false negative on real DRE/Forest Edition
+          servers: v3.1 only read the registry (InstallPath, and thus the FE
+          DLL path check) inside the "PSSnapin not registered" fallback
+          branch of module loading. Whenever the base RMAD cmdlets were
+          already loaded in the session (the common case when RMADGrab is
+          run from RMAD's own Management Shell shortcut), that branch never
+          ran, so InstallPath stayed null and edition detection had nothing
+          to check besides "is Get-RMADFEProject already loaded" - which can
+          be false even on genuine DRE installs if the FE-specific module
+          just wasn't imported into that particular session. Confirmed on a
+          real customer server: RMAD Version Detected correctly showed
+          "Disaster Recovery Edition" from the uninstall string, but Edition
+          Detection still reported "Standard Edition".
+        - The registry actually exposes a direct, authoritative signal for
+          this: HKLM:\SOFTWARE\Quest\Recovery Manager for Active
+          Directory\ForestEdition (REG_DWORD, 1 = DRE/Forest Edition). The
+          registry is now always read up front regardless of module load
+          path, and this flag is the primary edition signal - cmdlet/DLL
+          presence are secondary confirmation only.
+        - Added a separate, independent probe/load attempt for the
+          Forest Edition-specific module, decoupled from the base-cmdlet
+          check - so a session with the base snap-in already loaded still
+          gets a chance to pick up the FE module if it's missing.
+        - If the registry confirms DRE but FE cmdlets still aren't available
+          after that load attempt, this is now surfaced as an explicit
+          warning (rather than silently mislabeling as Standard Edition or
+          just having Forest Recovery/Hybrid Recovery/Cloud Storage sections
+          come back "unavailable" with no explanation).
+        - Registry CurrentVersion is now used as a fallback source for
+          RMADVersion if the uninstall-key lookup finds nothing.
 
     Changes from v3.0:
         - Added a Secure Storage section: lists registered Secure Storage
@@ -66,7 +98,7 @@
 
 
 Write-Host "========================================="
-Write-Host " RMADGrab v3.1 - RMAD Baseline Extractor"
+Write-Host " RMADGrab v3.2 - RMAD Baseline Extractor"
 Write-Host " Generated: $(Get-Date)"
 Write-Host "=========================================`n"
 
@@ -81,16 +113,17 @@ $jsonMin   = "RMADGrab_$timestamp.min.json"
 $RMADGrab = [ordered]@{}
 
 $RMADGrab.Meta = [ordered]@{
-    ScriptVersion   = "3.1"
-    RMADVersion     = $null
-    RMADEdition     = "Unknown"
-    IsDRE           = $false
-    VersionOK       = $false
-    ModuleLoadMethod = $null
-    InstallPath     = $null
-    LoadedModules   = @()
-    Warnings        = @()
-    SkippedSections = @()
+    ScriptVersion            = "3.2"
+    RMADVersion              = $null
+    RMADEdition              = "Unknown"
+    IsDRE                    = $false
+    ForestEditionRegistryFlag = $null
+    VersionOK                = $false
+    ModuleLoadMethod         = $null
+    InstallPath              = $null
+    LoadedModules            = @()
+    Warnings                 = @()
+    SkippedSections          = @()
 }
 
 function Add-Warn { param($msg) ; $RMADGrab.Meta.Warnings += $msg ; Write-Warning $msg }
@@ -150,7 +183,7 @@ function Get-RedactedObject {
 # ---------------------------------------------------------
 # VERSION DETECTION
 # ---------------------------------------------------------
-Write-Host "=== RMADGrab v3.1 - Version Detection ==="
+Write-Host "=== RMADGrab v3.2 - Version Detection ==="
 
 $uninstallRoots = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -191,6 +224,41 @@ Write-Host ""
 # ---------------------------------------------------------
 Write-Host "=== MODULE DISCOVERY ==="
 
+# Always read the registry first, regardless of whether the base RMAD
+# cmdlets are already loaded in this session. v3.1 only did this lookup
+# inside the "snap-in not registered" fallback branch, which meant it was
+# skipped entirely whenever cmdlets were already loaded - silently losing
+# InstallPath (and the authoritative ForestEdition flag below) on exactly
+# the common case of a session opened via RMAD's own Management Shell
+# shortcut. That, in turn, broke edition detection on real DRE servers.
+$regCandidates = @(
+    "HKLM:\SOFTWARE\Quest\Recovery Manager for Active Directory",
+    "HKLM:\SOFTWARE\WOW6432Node\Quest\Recovery Manager for Active Directory"
+)
+
+$rmadRegProps = $null
+foreach ($regPath in $regCandidates) {
+    $rmadRegProps = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+    if ($rmadRegProps) { break }
+}
+
+if ($rmadRegProps) {
+    $RMADGrab.Meta.InstallPath = $rmadRegProps.InstallPath
+    if ($null -ne $rmadRegProps.ForestEdition) {
+        # ForestEdition is a REG_DWORD flag (0/1) written directly by the
+        # installer - the single most authoritative edition signal
+        # available, since it doesn't depend on what happens to be loaded
+        # in the current PowerShell session.
+        $RMADGrab.Meta.ForestEditionRegistryFlag = [bool]$rmadRegProps.ForestEdition
+    }
+    # Fallback source for version info if the uninstall-key lookup earlier
+    # came up empty.
+    if (-not $RMADGrab.Meta.RMADVersion -and $rmadRegProps.CurrentVersion) {
+        $RMADGrab.Meta.RMADVersion = $rmadRegProps.CurrentVersion
+        Write-Host "RMAD Version (from registry CurrentVersion, uninstall key lookup found nothing): $($rmadRegProps.CurrentVersion)"
+    }
+}
+
 if (Get-Command Get-RMADBackup -ErrorAction SilentlyContinue) {
     $RMADGrab.Meta.ModuleLoadMethod = 'AlreadyLoaded'
     Write-Host "RMAD cmdlets already loaded in this session."
@@ -205,29 +273,16 @@ else {
     catch {
         Write-Host "PSSnapin not available, falling back to registry-based module discovery..." -ForegroundColor Yellow
 
-        $regCandidates = @(
-            "HKLM:\SOFTWARE\Quest\Recovery Manager for Active Directory",
-            "HKLM:\SOFTWARE\WOW6432Node\Quest\Recovery Manager for Active Directory"
-        )
-
-        $installPath = $null
-        foreach ($regPath in $regCandidates) {
-            $installPath = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).InstallPath
-            if ($installPath) { break }
-        }
-
-        $RMADGrab.Meta.InstallPath = $installPath
-
-        if (-not $installPath) {
+        if (-not $RMADGrab.Meta.InstallPath) {
             Add-Warn "RMAD InstallPath not found in the registry, and the PSSnapin isn't registered. Module-dependent sections will be skipped."
         }
         else {
-            Write-Host "RMAD InstallPath: $installPath"
+            Write-Host "RMAD InstallPath: $($RMADGrab.Meta.InstallPath)"
 
             $candidateDlls = @(
-                (Join-Path $installPath "QuestSoftware.RecoveryManager.AD.PowerShell64.dll"),
-                (Join-Path $installPath "QuestSoftware.RecoveryManager.AD.PowerShell.dll"),
-                (Join-Path $installPath "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll")
+                (Join-Path $RMADGrab.Meta.InstallPath "QuestSoftware.RecoveryManager.AD.PowerShell64.dll"),
+                (Join-Path $RMADGrab.Meta.InstallPath "QuestSoftware.RecoveryManager.AD.PowerShell.dll"),
+                (Join-Path $RMADGrab.Meta.InstallPath "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll")
             )
 
             $loadedModules = @()
@@ -248,13 +303,34 @@ else {
             $RMADGrab.Meta.ModuleLoadMethod = 'RegistryDllImport'
 
             if ($loadedModules.Count -eq 0) {
-                Add-Warn "No RMAD PowerShell module DLLs could be loaded from '$installPath'."
+                Add-Warn "No RMAD PowerShell module DLLs could be loaded from '$($RMADGrab.Meta.InstallPath)'."
             }
         }
     }
 
     if (-not (Get-Command Get-RMADBackup -ErrorAction SilentlyContinue)) {
         Add-Warn "RMAD cmdlets are not available after module discovery. All RMAD-cmdlet-dependent sections will be skipped."
+    }
+}
+
+# Separately probe for the Forest Edition-specific module. This has to be
+# independent of the base-cmdlet check above: a session can have the base
+# snap-in already loaded (e.g. opened via a shortcut that's been carried
+# forward through years of upgrades) without the FE-specific module ever
+# having been imported into that same session, even on a genuine DRE/FE
+# install. That mismatch is exactly what produced a false "Standard Edition"
+# read on an actual DRE server - the base cmdlets were "AlreadyLoaded" so the
+# registry/DLL-loading branch above never ran at all.
+if (-not (Get-Command Get-RMADFEProject -ErrorAction SilentlyContinue) -and $RMADGrab.Meta.InstallPath) {
+    $feDll = Join-Path $RMADGrab.Meta.InstallPath "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll"
+    if (Test-Path -LiteralPath $feDll) {
+        try {
+            Import-Module $feDll -ErrorAction Stop
+            Write-Host "Loaded FE module: $feDll"
+        }
+        catch {
+            Add-Warn "Found the Forest Edition module DLL at '$feDll' but failed to load it: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -265,10 +341,11 @@ Write-Host ""
 # ---------------------------------------------------------
 Write-Host "=== EDITION DETECTION ==="
 
-# Prefer a direct cmdlet-availability check - if Forest Edition-only cmdlets
-# resolve, this is DRE/Forest Edition. Fall back to checking whether the FE
-# DLL exists on disk, in case the FE cmdlets aren't imported into this scope
-# for some other reason.
+# The registry's ForestEdition flag is the primary, authoritative signal -
+# it reflects what was actually installed, not what happens to be loaded in
+# this particular session. Cmdlet/DLL presence are secondary confirmation
+# and a fallback for cases where the registry value isn't available.
+$feRegistryFlag  = $RMADGrab.Meta.ForestEditionRegistryFlag -eq $true
 $feCmdletPresent = [bool](Get-Command Get-RMADFEProject -ErrorAction SilentlyContinue)
 
 $feDllOnDisk = $false
@@ -276,7 +353,7 @@ if ($RMADGrab.Meta.InstallPath) {
     $feDllOnDisk = Test-Path -LiteralPath (Join-Path $RMADGrab.Meta.InstallPath "QuestSoftware.RecoveryManager.AD.PowerShellFE.dll")
 }
 
-if ($feCmdletPresent -or $feDllOnDisk) {
+if ($feRegistryFlag -or $feCmdletPresent -or $feDllOnDisk) {
     $RMADGrab.Meta.IsDRE = $true
     $RMADGrab.Meta.RMADEdition = "Forest Edition (DRE)"
 } else {
@@ -284,7 +361,17 @@ if ($feCmdletPresent -or $feDllOnDisk) {
     $RMADGrab.Meta.RMADEdition = "Standard Edition"
 }
 
-Write-Host "RMAD Edition: $($RMADGrab.Meta.RMADEdition)"
+# If the registry confirms DRE but the FE cmdlets still aren't loaded even
+# after the load attempt above (e.g. the DLL wasn't where we expected, or
+# failed to import), say so explicitly - otherwise the Forest
+# Recovery/Hybrid Recovery/Cloud Storage sections further down will just
+# come back "unavailable" with no indication that the edition itself was
+# identified correctly.
+if ($feRegistryFlag -and -not $feCmdletPresent) {
+    Add-Warn "Registry confirms this install is Forest Edition/DRE (ForestEdition=1), but Forest Edition-specific cmdlets (e.g. Get-RMADFEProject) are still not available in this session even after attempting to load the FE module. Forest Recovery / Hybrid Recovery / Cloud Storage sections below may report 'unavailable' despite the feature genuinely being present - try re-running from the 'Recovery Manager for Active Directory Forest Edition' Management Shell shortcut specifically."
+}
+
+Write-Host "RMAD Edition: $($RMADGrab.Meta.RMADEdition) (registry flag: $feRegistryFlag, FE cmdlet loaded: $feCmdletPresent, FE DLL on disk: $feDllOnDisk)"
 Write-Host "=== Edition & Version Detection Complete ===`n"
 
 # ---------------------------------------------------------
@@ -849,5 +936,5 @@ foreach ($key in $RMADGrab.Keys) {
 Write-Host "Markdown written to: $mdFile"
 Write-Host ""
 Write-Host "==================================="
-Write-Host " RMADGrab v3.1 COMPLETE"
-Write-Host "===================================" 
+Write-Host " RMADGrab v3.2 COMPLETE"
+Write-Host "==================================="
