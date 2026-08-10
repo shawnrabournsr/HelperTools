@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    RMADGrab v3.0
+    RMADGrab v3.1
     RMAD Baseline Extractor (Edition-aware, Version-aware)
 
 .DESCRIPTION
@@ -8,7 +8,35 @@
     hybrid recovery, sessions, environment identity, and directory service
     (Recycle Bin + Tombstone Lifetime).
 
-    Changes from v2.2:
+    Changes from v3.0:
+        - Added a Secure Storage section: lists registered Secure Storage
+          servers (Get-RMADStorageServer) and spot-checks a sample of
+          Secure Storage-backed backups (Test-RMADSecureStorageBackup).
+        - Added a Cloud Storage (Tier 2) section, DRE/Forest Edition-only:
+          reports on Azure Blob / AWS S3 targets registered via
+          Get-RMADFECloudStorage. Skips gracefully (with a message) on
+          Standard Edition or if the cmdlet isn't present.
+        - Added a generic Get-RedactedObject helper for object types whose
+          exact schema isn't confirmed from Quest's docs (StorageServer,
+          CloudStorage) - scans every property and redacts anything whose
+          *name* looks secret-shaped, rather than dumping the object as-is.
+        - Broadened the redaction match pattern from "Credential|Password|
+          Secret" to also catch "ConnectionString", "AccessKey", "ApiKey",
+          "Token", "Pwd", and anything ending in "Key". This closes a real
+          gap: Set-RMADFECloudStorage takes -AzureConnectionString and
+          -AwsAccessKey directly (an Azure connection string typically
+          embeds the storage account key), and the old pattern would have
+          missed both.
+        - Made the Backup Integrity "no DB write" switch detection dynamic
+          (probes Test-RMADBackup's actual parameter set at runtime) instead
+          of hardcoding -NoUpdate, which doesn't exist on all versions.
+          Confirmed via a live Get-Help against RMAD DRE that this cmdlet's
+          parameter set is just -Id/-InputObject, -ShareCredential, and
+          -UseStorageCredential - no write-control switch at all on that
+          version - so the messaging reports what's actually known rather
+          than assuming a database-write side effect.
+
+    Changes from v2.2 (carried forward into v3.x):
         - Fixed version comparison bug: "$ver.Major -ge 10 -and $ver.Minor -ge 4"
           incorrectly flagged anything like 11.0 as "below 10.4". Now does a
           real System.Version comparison.
@@ -36,8 +64,9 @@
         - RMADGrab_yyyy-MM-dd_HHmmss.md        (Markdown)
 #>
 
+
 Write-Host "========================================="
-Write-Host " RMADGrab v3.0 - RMAD Baseline Extractor"
+Write-Host " RMADGrab v3.1 - RMAD Baseline Extractor"
 Write-Host " Generated: $(Get-Date)"
 Write-Host "=========================================`n"
 
@@ -52,7 +81,7 @@ $jsonMin   = "RMADGrab_$timestamp.min.json"
 $RMADGrab = [ordered]@{}
 
 $RMADGrab.Meta = [ordered]@{
-    ScriptVersion   = "3.0"
+    ScriptVersion   = "3.1"
     RMADVersion     = $null
     RMADEdition     = "Unknown"
     IsDRE           = $false
@@ -105,7 +134,11 @@ function Get-RedactedObject {
 
     $result = [ordered]@{}
     foreach ($prop in $InputObj.PSObject.Properties) {
-        if ($prop.Name -match 'Credential|Password|Secret') {
+        # Broad on purpose: a missed secret is a leak, a redacted non-secret is
+        # just a slightly less informative export. Catches things like
+        # AzureConnectionString (embeds an account key) and AwsAccessKey that
+        # a narrower "Credential|Password|Secret" pattern would miss.
+        if ($prop.Name -match 'Credential|Password|Secret|ConnectionString|AccessKey|ApiKey|Token|Pwd|Key$') {
             $result[$prop.Name] = Get-RedactedCredentialInfo -CredObj $prop.Value
         } else {
             $result[$prop.Name] = $prop.Value
@@ -117,7 +150,7 @@ function Get-RedactedObject {
 # ---------------------------------------------------------
 # VERSION DETECTION
 # ---------------------------------------------------------
-Write-Host "=== RMADGrab v3.0 - Version Detection ==="
+Write-Host "=== RMADGrab v3.1 - Version Detection ==="
 
 $uninstallRoots = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -486,6 +519,51 @@ try {
 Write-Host "`n"
 
 # ---------------------------------------------------------
+# CLOUD STORAGE (Tier 2 - Azure Blob / AWS S3, DRE-only)
+# ---------------------------------------------------------
+# NOTE: this is a distinct feature from the on-prem Secure Storage server
+# above. RMAD DRE/Forest Edition can additionally copy backups to an Azure
+# Blob or AWS S3 container as a secondary (Tier 2) destination, configured
+# via Get-RMADFECloudStorage / Set-RMADFECloudStorage. Confirmed from Quest's
+# docs that Set-RMADFECloudStorage takes -AzureConnectionString,
+# -AwsAccessKey, and -AwsSecretKey directly - an Azure connection string in
+# particular typically embeds the storage account key. If Get-RMADFECloudStorage
+# returns the same properties, that's real secret material, so this section
+# goes through the same generic Get-RedactedObject redaction as everything
+# else rather than being dumped raw.
+Write-Host "=== CLOUD STORAGE (Tier 2) ==="
+
+$RMADGrab.CloudStorage = @()
+
+if ($RMADGrab.Meta.IsDRE) {
+    try {
+        $cloudStorageCmd = Get-Command Get-RMADFECloudStorage -ErrorAction SilentlyContinue
+        if ($cloudStorageCmd) {
+            $cloudStorage = Get-RMADFECloudStorage -ErrorAction Stop
+
+            if ($cloudStorage) {
+                foreach ($cs in $cloudStorage) {
+                    $RMADGrab.CloudStorage += (Get-RedactedObject -InputObj $cs)
+                }
+                # Format-List on the redacted objects, not the raw ones - the
+                # console output shouldn't leak what the export doesn't.
+                $RMADGrab.CloudStorage | Format-List *
+            } else {
+                Write-Host "No cloud storage (Azure Blob / AWS S3) registered."
+            }
+        } else {
+            Write-Host "Get-RMADFECloudStorage cmdlet not available on this RMAD version/edition - skipping."
+        }
+    } catch {
+        Write-Warning "Cloud Storage unavailable: $($_.Exception.Message)"
+    }
+} else {
+    Skip-Section "CloudStorage (Standard Edition - Tier 2 cloud storage requires DRE/Forest Edition)"
+}
+
+Write-Host "`n"
+
+# ---------------------------------------------------------
 # BACKUP SESSIONS
 # ---------------------------------------------------------
 Write-Host "=== BACKUP SESSIONS (Last 14 Days) ==="
@@ -771,5 +849,5 @@ foreach ($key in $RMADGrab.Keys) {
 Write-Host "Markdown written to: $mdFile"
 Write-Host ""
 Write-Host "==================================="
-Write-Host " RMADGrab v3.0 COMPLETE"
-Write-Host "==================================="
+Write-Host " RMADGrab v3.1 COMPLETE"
+Write-Host "===================================" 
