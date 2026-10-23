@@ -10,6 +10,8 @@
     Target domain (DNS or NetBIOS name). Defaults to the current user's domain.
 .PARAMETER Server
     Specific DC to query for AD, SYSVOL and NETLOGON. Defaults to the target domain's PDC emulator.
+.PARAMETER UserCsv
+    Detail file with one row per script/user pair (every user whose scriptPath references a script).
 .PARAMETER Credential
     Credentials for the target domain (e.g. when running from a bastion/admin forest).
     Used for AD queries and the SYSVOL/NETLOGON shares. The GroupPolicy module does not accept
@@ -29,6 +31,7 @@ param(
     [pscredential]$Credential,
     [string[]]$Extensions = @('.bat', '.cmd', '.ps1', '.vbs', '.js', '.wsf', '.kix'),
     [string]$OutCsv = '.\NetlogonScriptUsage.csv',
+    [string]$UserCsv = '.\NetlogonScriptUsers.csv',
     [switch]$IncludeGpoReports
 )
 
@@ -123,6 +126,7 @@ try {
 
     # --- Check each script ---------------------------------------------------
 
+    $userRows = [System.Collections.Generic.List[object]]::new()
     $i = 0
     $results = foreach ($s in $scripts) {
         $i++
@@ -136,6 +140,18 @@ try {
         $userHits   = @($users       | Where-Object { $_.scriptPath -match $pattern })
         $scriptHits = @($scripts     | Where-Object { $_.RelPath -ne $s.RelPath -and $_.Text -match $pattern })
 
+        foreach ($u in $userHits) {
+            $userRows.Add([pscustomobject]@{
+                Domain            = $Domain
+                Script            = $s.RelPath
+                SamAccountName    = $u.SamAccountName
+                Name              = $u.Name
+                Enabled           = $u.Enabled
+                ScriptPath        = $u.scriptPath
+                DistinguishedName = $u.DistinguishedName
+            })
+        }
+
         $gpos = @(@($gpoHits | ForEach-Object Gpo) + @($reportHits | ForEach-Object Gpo) | Sort-Object -Unique)
 
         [pscustomobject]@{
@@ -145,7 +161,9 @@ try {
             Unreferenced    = ($gpos.Count + $userHits.Count + $scriptHits.Count) -eq 0
             GPOs            = $gpos -join '; '
             UserCount       = $userHits.Count
-            Users           = ($userHits | Select-Object -First 25 | ForEach-Object SamAccountName) -join '; '
+            DisabledUsers   = @($userHits | Where-Object { -not $_.Enabled }).Count
+            UsersPreview    = (($userHits | Select-Object -First 10 | ForEach-Object SamAccountName) -join '; ') +
+                              $(if ($userHits.Count -gt 10) { "; (+$($userHits.Count - 10) more, see $UserCsv)" })
             CalledByScripts = ($scriptHits | ForEach-Object RelPath) -join '; '
             GpoFiles        = ($gpoHits | ForEach-Object Path | Sort-Object -Unique) -join '; '
         }
@@ -153,10 +171,13 @@ try {
     Write-Progress -Activity 'Checking scripts' -Completed
 
     $results | Sort-Object Unreferenced, Script | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+    $userRows | Sort-Object Script, SamAccountName | Export-Csv -Path $UserCsv -NoTypeInformation -Encoding UTF8
     $results | Sort-Object Unreferenced, Script | Format-Table Script, Unreferenced, GPOs, UserCount, CalledByScripts -AutoSize -Wrap
 
     $unused = @($results | Where-Object Unreferenced).Count
-    Write-Host "`n$(@($results).Count) scripts checked in $Domain, $unused with no references found. Full results: $OutCsv"
+    Write-Host "`n$(@($results).Count) scripts checked in $Domain, $unused with no references found."
+    Write-Host "Summary: $OutCsv"
+    Write-Host "Users:   $UserCsv ($($userRows.Count) script/user pairs)"
 }
 finally {
     $drives | ForEach-Object { Remove-PSDrive -Name $_.Name -ErrorAction SilentlyContinue }
